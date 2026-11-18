@@ -1,0 +1,10 @@
+opencv-python
+mediapipe
+numpy
+ultralytics
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+pydantic
+reportlab

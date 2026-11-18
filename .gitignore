@@ -1,0 +1,27 @@
+# Python Virtual Environment
+venv/
+env/
+ENV/
+*.venv
+
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak
+
+# Node & Frontend build dependencies
+frontend/node_modules/
+frontend/.tmp/
+frontend/.vite/
+
+# Examination Recordings (Large video files)
+recordings/
+*.mp4
+*.avi
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

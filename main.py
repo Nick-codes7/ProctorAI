@@ -1,0 +1,2989 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+import math
+import os
+import re
+from datetime import datetime
+
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from ultralytics import YOLO
+
+
+# ============================================================
+# AI PROCTOR - VERSION 0.6
+#
+# Features:
+#   Face / multiple-face detection
+#   Head pose: left / right / up / down
+#   Gaze monitoring
+#   Hand detection
+#   Generic external-object detection
+#   Low-light detection
+#   Candidate framing / upper-body positioning
+#   Experimental camera-movement detection
+#   Event START / END tracking
+#   Event duration + occurrence count
+#   Evidence screenshot at each event START
+#   MP4 recording
+#   TXT event log
+#   Session folder containing MP4 + TXT + evidence/
+#   Explainable initial risk index
+#
+# Press Q to stop.
+# ============================================================
+
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
+
+FACE_MODEL_PATH = os.path.join(
+    MODELS_DIR, "face_landmarker.task"
+)
+
+HAND_MODEL_PATH = os.path.join(
+    MODELS_DIR, "hand_landmarker.task"
+)
+
+POSE_MODEL_PATH = os.path.join(
+    MODELS_DIR, "pose_landmarker_full.task"
+)
+
+YOLO_MODEL = "yolo26n.pt"
+
+
+# ============================================================
+# DETECTION CONFIGURATION
+# ============================================================
+
+FACE_MISSING_THRESHOLD = 2.0
+MULTIPLE_FACE_THRESHOLD = 1.0
+
+CALIBRATION_DURATION = 3.0
+
+YAW_THRESHOLD = 15.0
+PITCH_THRESHOLD = 15.0
+HEAD_WARNING_TIME = 1.0
+
+GAZE_HORIZONTAL_THRESHOLD = 0.055
+GAZE_VERTICAL_THRESHOLD = 0.055
+GAZE_WARNING_TIME = 0.7
+GAZE_SMOOTHING = 0.35
+
+OBJECT_CONFIDENCE = 0.45
+OBJECT_WARNING_TIME = 0.8
+
+HAND_WARNING_TIME = 0.5
+
+HAND_DETECTION_CONFIDENCE = 0.5
+HAND_PRESENCE_CONFIDENCE = 0.5
+HAND_TRACKING_CONFIDENCE = 0.5
+MAX_HANDS = 2
+
+LOW_LIGHT_BRIGHTNESS_THRESHOLD = 55
+LOW_LIGHT_WARNING_TIME = 2.0
+
+# ------------------------------------------------------------
+# Framing configuration
+#
+# We do NOT require the whole body.
+# We require:
+#   - one face
+#   - both shoulders sufficiently visible
+#   - torso extending meaningfully below shoulders
+#   - candidate not excessively zoomed in
+# ------------------------------------------------------------
+
+POSE_VISIBILITY_THRESHOLD = 0.50
+
+FRAMING_WARNING_TIME = 2.0
+
+# Torso should extend below the shoulder line by this amount.
+MIN_TORSO_BELOW_SHOULDER = 0.18
+
+# At least one of these lower-body landmarks should be visible.
+LOWER_BODY_VISIBILITY_THRESHOLD = 0.45
+
+# If face width becomes too large, candidate is probably too close /
+# camera is excessively zoomed.
+MAX_FACE_WIDTH_RATIO = 0.42
+
+# Candidate should not be tiny in the frame.
+MIN_FACE_WIDTH_RATIO = 0.06
+
+# Candidate's shoulder span should be reasonably visible.
+MIN_SHOULDER_WIDTH_RATIO = 0.15
+
+
+# ============================================================
+# CAMERA MOVEMENT
+# ============================================================
+
+CAMERA_MOVEMENT_WARNING_TIME = 1.0
+
+# Minimum percentage of tracked feature points that must move
+# consistently before we call it global camera movement.
+CAMERA_MOVEMENT_RATIO = 0.65
+
+CAMERA_MOVEMENT_PIXELS = 18.0
+
+# Camera movement is experimental and intentionally not given
+# a high risk weight.
+CAMERA_MOVEMENT_MIN_FEATURES = 40
+
+
+# ============================================================
+# RISK ENGINE
+# ============================================================
+
+EVENT_WEIGHTS = {
+    "Face not detected": 4.0,
+    "Multiple faces detected": 5.0,
+    "Head turned left": 2.0,
+    "Head turned right": 2.0,
+    "Looking up": 2.0,
+    "Looking down": 2.0,
+    "Gaze away from screen": 1.0,
+    "Hand detected": 2.0,
+    "Object detected": 3.0,
+    "Low light": 2.0,
+    "Candidate not properly positioned": 3.0,
+    "Camera movement detected": 1.0,
+}
+
+NORMAL_LIMIT = 5.0
+ATTENTION_LIMIT = 12.0
+HIGH_LIMIT = 20.0
+MAX_RISK = 100.0
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_filename(text):
+    """Convert event text into a Windows-safe filename."""
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")
+
+
+def format_clock(seconds):
+    """Format elapsed seconds as HH:MM:SS."""
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def format_evidence_timestamp(seconds):
+    """Format elapsed time as HH-MM-SS for filenames."""
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours:02d}-{minutes:02d}-{seconds:02d}"
+
+
+def format_duration(seconds):
+    return format_clock(seconds)
+
+
+# ============================================================
+# EVENT TRACKER
+# ============================================================
+
+class EventTracker:
+
+    def __init__(
+        self,
+        event_name,
+        log_file,
+        evidence_dir,
+        session_start
+    ):
+        self.event_name = event_name
+        self.log_file = log_file
+        self.evidence_dir = evidence_dir
+        self.session_start = session_start
+
+        self.active = False
+        self.start_time = None
+        self.total_duration = 0.0
+        self.occurrences = 0
+        self.last_evidence_path = None
+
+    def start(self, current_time, frame):
+        """
+        Start the event once.
+        A screenshot is created only at the beginning of an
+        occurrence, not on every frame.
+        """
+        if self.active:
+            return
+
+        self.active = True
+        self.start_time = current_time
+        self.occurrences += 1
+
+        elapsed = current_time - self.session_start
+        timestamp = format_clock(elapsed)
+        file_timestamp = format_evidence_timestamp(elapsed)
+
+        event_slug = safe_filename(self.event_name)
+
+        evidence_filename = (
+            f"{file_timestamp}_{event_slug}.jpg"
+        )
+
+        evidence_path = os.path.join(
+            self.evidence_dir,
+            evidence_filename
+        )
+
+        try:
+            cv2.imwrite(
+                evidence_path,
+                frame
+            )
+            self.last_evidence_path = evidence_filename
+        except Exception:
+            self.last_evidence_path = None
+
+        self.log_file.write(
+            f"{timestamp}  "
+            f"{self.event_name} - START"
+        )
+
+        if self.last_evidence_path:
+            self.log_file.write(
+                f" | Evidence: "
+                f"evidence/{self.last_evidence_path}"
+            )
+
+        self.log_file.write("\n")
+        self.log_file.flush()
+
+    def end(self, current_time):
+        if not self.active:
+            return
+
+        duration = current_time - self.start_time
+        self.total_duration += duration
+
+        self.active = False
+
+        elapsed = current_time - self.session_start
+        timestamp = format_clock(elapsed)
+
+        self.log_file.write(
+            f"{timestamp}  "
+            f"{self.event_name} - END "
+            f"(Duration: {format_duration(duration)})\n"
+        )
+
+        self.log_file.flush()
+
+    def close(self, current_time):
+        """Close an event that is still active when Q is pressed."""
+        if not self.active:
+            return
+
+        duration = current_time - self.start_time
+        self.total_duration += duration
+
+        elapsed = current_time - self.session_start
+        timestamp = format_clock(elapsed)
+
+        self.log_file.write(
+            f"{timestamp}  "
+            f"{self.event_name} - END "
+            f"(Duration: {format_duration(duration)})\n"
+        )
+
+        self.active = False
+
+
+# ============================================================
+# HEAD POSE
+# ============================================================
+
+def calculate_head_pose(
+    face_landmarks,
+    frame_width,
+    frame_height
+):
+    landmark_ids = {
+        "nose": 1,
+        "chin": 152,
+        "left_eye": 33,
+        "right_eye": 263,
+        "left_mouth": 61,
+        "right_mouth": 291,
+    }
+
+    image_points = []
+
+    for landmark_id in landmark_ids.values():
+        landmark = face_landmarks[landmark_id]
+
+        image_points.append([
+            landmark.x * frame_width,
+            landmark.y * frame_height,
+        ])
+
+    image_points = np.array(
+        image_points,
+        dtype=np.float64
+    )
+
+    model_points = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, -63.6, -12.5],
+            [-43.3, 32.7, -26.0],
+            [43.3, 32.7, -26.0],
+            [-28.9, -28.9, -24.1],
+            [28.9, -28.9, -24.1],
+        ],
+        dtype=np.float64
+    )
+
+    focal_length = frame_width
+
+    center = (
+        frame_width / 2,
+        frame_height / 2
+    )
+
+    camera_matrix = np.array(
+        [
+            [focal_length, 0, center[0]],
+            [0, focal_length, center[1]],
+            [0, 0, 1],
+        ],
+        dtype=np.float64
+    )
+
+    distortion_coefficients = np.zeros(
+        (4, 1),
+        dtype=np.float64
+    )
+
+    success, rotation_vector, _ = cv2.solvePnP(
+        model_points,
+        image_points,
+        camera_matrix,
+        distortion_coefficients,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+
+    if not success:
+        return None, None, None
+
+    rotation_matrix, _ = cv2.Rodrigues(
+        rotation_vector
+    )
+
+    sy = math.sqrt(
+        rotation_matrix[0, 0] ** 2 +
+        rotation_matrix[1, 0] ** 2
+    )
+
+    if sy >= 1e-6:
+
+        pitch = math.atan2(
+            rotation_matrix[2, 1],
+            rotation_matrix[2, 2]
+        )
+
+        yaw = math.atan2(
+            -rotation_matrix[2, 0],
+            sy
+        )
+
+        roll = math.atan2(
+            rotation_matrix[1, 0],
+            rotation_matrix[0, 0]
+        )
+
+    else:
+
+        pitch = math.atan2(
+            -rotation_matrix[1, 2],
+            rotation_matrix[1, 1]
+        )
+
+        yaw = math.atan2(
+            -rotation_matrix[2, 0],
+            sy
+        )
+
+        roll = 0
+
+    pitch = math.degrees(pitch)
+    yaw = math.degrees(yaw)
+    roll = math.degrees(roll)
+
+    if pitch < -90:
+        pitch += 180
+    elif pitch > 90:
+        pitch -= 180
+
+    return yaw, pitch, roll
+
+
+# ============================================================
+# GAZE
+# ============================================================
+
+def calculate_gaze(face_landmarks):
+
+    left_iris = [468, 469, 470, 471, 472]
+    right_iris = [473, 474, 475, 476, 477]
+
+    left_iris_x = np.mean([
+        face_landmarks[i].x
+        for i in left_iris
+    ])
+
+    left_iris_y = np.mean([
+        face_landmarks[i].y
+        for i in left_iris
+    ])
+
+    right_iris_x = np.mean([
+        face_landmarks[i].x
+        for i in right_iris
+    ])
+
+    right_iris_y = np.mean([
+        face_landmarks[i].y
+        for i in right_iris
+    ])
+
+    left_outer = face_landmarks[33]
+    left_inner = face_landmarks[133]
+
+    left_top = face_landmarks[159]
+    left_bottom = face_landmarks[145]
+
+    right_inner = face_landmarks[362]
+    right_outer = face_landmarks[263]
+
+    right_top = face_landmarks[386]
+    right_bottom = face_landmarks[374]
+
+    left_eye_width = (
+        left_inner.x - left_outer.x
+    )
+
+    right_eye_width = (
+        right_outer.x - right_inner.x
+    )
+
+    if abs(left_eye_width) < 0.001:
+        return None, None
+
+    if abs(right_eye_width) < 0.001:
+        return None, None
+
+    left_x = (
+        left_iris_x - left_outer.x
+    ) / left_eye_width
+
+    right_x = (
+        right_outer.x - right_iris_x
+    ) / right_eye_width
+
+    horizontal = (
+        left_x + right_x
+    ) / 2.0
+
+    left_eye_height = (
+        left_bottom.y - left_top.y
+    )
+
+    right_eye_height = (
+        right_bottom.y - right_top.y
+    )
+
+    if abs(left_eye_height) < 0.001:
+        return None, None
+
+    if abs(right_eye_height) < 0.001:
+        return None, None
+
+    left_y = (
+        left_iris_y - left_top.y
+    ) / left_eye_height
+
+    right_y = (
+        right_iris_y - right_top.y
+    ) / right_eye_height
+
+    vertical = (
+        left_y + right_y
+    ) / 2.0
+
+    return horizontal, vertical
+
+
+# ============================================================
+# YOLO OBJECT DETECTION
+# ============================================================
+
+def detect_external_objects(
+    model,
+    frame
+):
+    results = model.predict(
+        source=frame,
+        conf=OBJECT_CONFIDENCE,
+        verbose=False
+    )
+
+    detected_objects = []
+
+    if not results:
+        return detected_objects
+
+    result = results[0]
+
+    if result.boxes is None:
+        return detected_objects
+
+    for box in result.boxes:
+
+        confidence = float(box.conf[0])
+
+        if confidence < OBJECT_CONFIDENCE:
+            continue
+
+        class_id = int(box.cls[0])
+
+        # COCO class 0 = person.
+        # Candidate person is ignored here.
+        if class_id == 0:
+            continue
+
+        x1, y1, x2, y2 = map(
+            int,
+            box.xyxy[0]
+        )
+
+        detected_objects.append({
+            "bbox": (x1, y1, x2, y2),
+            "confidence": confidence
+        })
+
+    return detected_objects
+
+
+# ============================================================
+# POSE / FRAMING
+# ============================================================
+
+def landmark_visible(
+    landmark,
+    threshold=POSE_VISIBILITY_THRESHOLD
+):
+    """
+    MediaPipe Pose landmarks normally expose visibility.
+    Some versions may expose None, so we handle that safely.
+    """
+    visibility = getattr(
+        landmark,
+        "visibility",
+        1.0
+    )
+
+    if visibility is None:
+        visibility = 1.0
+
+    return visibility >= threshold
+
+
+def calculate_framing_status(
+    pose_result,
+    face_landmarks,
+    frame_width,
+    frame_height
+):
+    """
+    Returns:
+        valid: bool
+        reason: str
+        metrics: dict
+
+    The goal is not to demand a full-body shot.
+    The goal is to ensure the candidate's upper body extends
+    meaningfully below the shoulders.
+    """
+
+    if not pose_result.pose_landmarks:
+        return (
+            False,
+            "Upper body not sufficiently visible",
+            {}
+        )
+
+    landmarks = pose_result.pose_landmarks[0]
+
+    # MediaPipe Pose indices:
+    # 0  = nose
+    # 11 = left shoulder
+    # 12 = right shoulder
+    # 13 = left elbow
+    # 14 = right elbow
+    # 15 = left wrist
+    # 16 = right wrist
+    # 23 = left hip
+    # 24 = right hip
+
+    nose = landmarks[0]
+    left_shoulder = landmarks[11]
+    right_shoulder = landmarks[12]
+    left_elbow = landmarks[13]
+    right_elbow = landmarks[14]
+    left_wrist = landmarks[15]
+    right_wrist = landmarks[16]
+    left_hip = landmarks[23]
+    right_hip = landmarks[24]
+
+    # --------------------------------------------------------
+    # Shoulder visibility
+    # --------------------------------------------------------
+
+    shoulders_visible = (
+        landmark_visible(left_shoulder)
+        and
+        landmark_visible(right_shoulder)
+    )
+
+    if not shoulders_visible:
+        return (
+            False,
+            "Both shoulders are not sufficiently visible",
+            {}
+        )
+
+    # --------------------------------------------------------
+    # Shoulder coordinates
+    # --------------------------------------------------------
+
+    shoulder_y = (
+        left_shoulder.y +
+        right_shoulder.y
+    ) / 2.0
+
+    shoulder_x = (
+        left_shoulder.x +
+        right_shoulder.x
+    ) / 2.0
+
+    shoulder_width = abs(
+        right_shoulder.x -
+        left_shoulder.x
+    )
+
+    # --------------------------------------------------------
+    # Face size
+    # --------------------------------------------------------
+
+    face_xs = [
+        landmark.x
+        for landmark in face_landmarks
+    ]
+
+    face_ys = [
+        landmark.y
+        for landmark in face_landmarks
+    ]
+
+    face_width = (
+        max(face_xs) -
+        min(face_xs)
+    )
+
+    face_height = (
+        max(face_ys) -
+        min(face_ys)
+    )
+
+    # --------------------------------------------------------
+    # Face too close / too far
+    # --------------------------------------------------------
+
+    if face_width > MAX_FACE_WIDTH_RATIO:
+        return (
+            False,
+            "Camera is too close or zoomed in",
+            {
+                "face_width": face_width,
+                "shoulder_width": shoulder_width,
+            }
+        )
+
+    if face_width < MIN_FACE_WIDTH_RATIO:
+        return (
+            False,
+            "Candidate is too far from the camera",
+            {
+                "face_width": face_width,
+                "shoulder_width": shoulder_width,
+            }
+        )
+
+    # --------------------------------------------------------
+    # Shoulder span
+    # --------------------------------------------------------
+
+    if shoulder_width < MIN_SHOULDER_WIDTH_RATIO:
+        return (
+            False,
+            "Upper body is not sufficiently visible",
+            {
+                "face_width": face_width,
+                "shoulder_width": shoulder_width,
+            }
+        )
+
+    # --------------------------------------------------------
+    # Lower-body / framing check
+    #
+    # IMPORTANT:
+    # We should NOT require MediaPipe to successfully detect
+    # hips, elbows or wrists. A perfectly acceptable webcam
+    # frame can show the shoulders and a large portion of the
+    # torso while Pose Landmarker temporarily loses lower-body
+    # landmarks.
+    #
+    # The previous implementation treated missing lower-body
+    # landmarks as a framing failure. That caused false
+    # "Candidate not properly positioned" warnings even when
+    # the candidate was visibly framed correctly.
+    #
+    # We therefore use the camera frame itself as the final
+    # fallback:
+    #   - both shoulders must be visible
+    #   - shoulder span must be reasonable
+    #   - face size must be reasonable
+    #   - there must be meaningful image area below the
+    #     shoulder line
+    #
+    # This still prevents an excessively zoomed face-only view,
+    # while avoiding random warnings caused by Pose Landmarker
+    # temporarily losing hips/elbows/wrists.
+    # --------------------------------------------------------
+
+    frame_below_shoulder = (
+        1.0 - shoulder_y
+    )
+
+    # How much of the image exists below the shoulder line.
+    # 0.20 means at least 20% of the frame remains below the
+    # shoulders.
+    if frame_below_shoulder >= MIN_TORSO_BELOW_SHOULDER:
+
+        return (
+            True,
+            "Framing OK",
+            {
+                "face_width": face_width,
+                "shoulder_width": shoulder_width,
+                "torso_extension": frame_below_shoulder,
+                "hips_visible": (
+                    landmark_visible(
+                        left_hip,
+                        LOWER_BODY_VISIBILITY_THRESHOLD
+                    )
+                    and
+                    landmark_visible(
+                        right_hip,
+                        LOWER_BODY_VISIBILITY_THRESHOLD
+                    )
+                ),
+            }
+        )
+
+    return (
+        False,
+        "Please adjust camera to show more of your upper body",
+        {
+            "face_width": face_width,
+            "shoulder_width": shoulder_width,
+            "torso_extension": frame_below_shoulder,
+        }
+    )
+
+
+# ============================================================
+# CAMERA MOVEMENT DETECTION
+# ============================================================
+
+class CameraMovementDetector:
+
+    def __init__(self):
+        self.previous_gray = None
+        self.previous_points = None
+        self.last_global_shift = 0.0
+        self.last_moving_ratio = 0.0
+
+    def reset(self):
+        self.previous_gray = None
+        self.previous_points = None
+
+    def update(self, frame):
+        """
+        Experimental global-motion detector.
+
+        It looks for a large fraction of tracked points moving
+        in roughly the same direction. Normal candidate motion
+        usually affects a smaller portion of the image.
+        """
+
+        gray = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        gray = cv2.GaussianBlur(
+            gray,
+            (5, 5),
+            0
+        )
+
+        if self.previous_gray is None:
+            self.previous_gray = gray
+            self.previous_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=8,
+                blockSize=7
+            )
+            return False
+
+        if (
+            self.previous_points is None
+            or
+            len(self.previous_points)
+            < CAMERA_MOVEMENT_MIN_FEATURES
+        ):
+            self.previous_gray = gray
+            self.previous_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=8,
+                blockSize=7
+            )
+            return False
+
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.previous_gray,
+            gray,
+            self.previous_points,
+            None
+        )
+
+        if next_points is None or status is None:
+            self.previous_gray = gray
+            self.previous_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=8,
+                blockSize=7
+            )
+            return False
+
+        good_old = self.previous_points[
+            status.flatten() == 1
+        ]
+
+        good_new = next_points[
+            status.flatten() == 1
+        ]
+
+        if len(good_old) < CAMERA_MOVEMENT_MIN_FEATURES:
+            self.previous_gray = gray
+            self.previous_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=8,
+                blockSize=7
+            )
+            return False
+
+        # Normalize OpenCV optical-flow points from (N, 1, 2)
+        # to (N, 2). This prevents boolean-index shape errors.
+        good_old = good_old.reshape(-1, 2)
+        good_new = good_new.reshape(-1, 2)
+
+        displacement = (
+            good_new - good_old
+        )
+
+        magnitudes = np.linalg.norm(
+            displacement,
+            axis=1
+        )
+
+        if len(magnitudes) == 0:
+            self.previous_gray = gray
+            self.previous_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=8,
+                blockSize=7
+            )
+            return False
+
+        moving_mask = (
+            magnitudes >
+            CAMERA_MOVEMENT_PIXELS
+        )
+
+        moving_ratio = (
+            np.sum(moving_mask) /
+            len(magnitudes)
+        )
+
+        if np.any(moving_mask):
+            median_shift = np.median(
+                displacement[moving_mask],
+                axis=0
+            )
+
+            global_shift = float(
+                np.linalg.norm(
+                    median_shift
+                )
+            )
+        else:
+            global_shift = 0.0
+
+        self.last_global_shift = global_shift
+        self.last_moving_ratio = moving_ratio
+
+        camera_moved = (
+            moving_ratio >= CAMERA_MOVEMENT_RATIO
+            and
+            global_shift >= CAMERA_MOVEMENT_PIXELS
+        )
+
+        # Use current points for next iteration.
+        self.previous_gray = gray
+        self.previous_points = good_new.reshape(
+            -1,
+            1,
+            2
+        )
+
+        # Periodically refresh points.
+        if len(good_new) < CAMERA_MOVEMENT_MIN_FEATURES * 1.5:
+            self.previous_points = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=200,
+                qualityLevel=0.01,
+                minDistance=8,
+                blockSize=7
+            )
+
+        return camera_moved
+
+
+# ============================================================
+# RISK CALCULATION
+# ============================================================
+
+def calculate_risk(
+    active_warnings,
+    current_time,
+    event_trackers
+):
+    if not active_warnings:
+        return 0.0
+
+    risk = 0.0
+
+    # --------------------------------------------------------
+    # Base + persistence
+    # --------------------------------------------------------
+
+    for warning in active_warnings:
+
+        base_weight = EVENT_WEIGHTS.get(
+            warning,
+            1.0
+        )
+
+        tracker = event_trackers[
+            warning
+        ]
+
+        duration = 0.0
+
+        if tracker.active:
+            duration = (
+                current_time -
+                tracker.start_time
+            )
+
+        # Gradual increase with duration.
+        # Capped to prevent one long event from instantly
+        # dominating everything.
+        duration_multiplier = min(
+            2.5,
+            1.0 + duration / 10.0
+        )
+
+        risk += (
+            base_weight *
+            duration_multiplier
+        )
+
+    # --------------------------------------------------------
+    # Simultaneous-event bonus
+    # --------------------------------------------------------
+
+    count = len(
+        active_warnings
+    )
+
+    if count >= 2:
+        risk += (
+            count - 1
+        ) * 2.0
+
+    # --------------------------------------------------------
+    # Recurrence bonus
+    # --------------------------------------------------------
+
+    for warning in active_warnings:
+
+        tracker = event_trackers[
+            warning
+        ]
+
+        if tracker.occurrences > 1:
+
+            repeated_count = (
+                tracker.occurrences - 1
+            )
+
+            risk += min(
+                5.0,
+                repeated_count * 0.75
+            )
+
+    return min(
+        MAX_RISK,
+        risk
+    )
+
+
+def get_risk_level(risk):
+
+    if risk < NORMAL_LIMIT:
+        return "NORMAL"
+
+    if risk < ATTENTION_LIMIT:
+        return "ATTENTION"
+
+    if risk < HIGH_LIMIT:
+        return "HIGH"
+
+    return "CRITICAL"
+
+
+
+
+def run_proctoring_session(
+    stop_event=None,
+    frame_callback=None,
+    telemetry_callback=None,
+    show_window=True,
+    camera_index=0
+):
+    # ============================================================
+    # MODEL CHECK
+    # ============================================================
+
+    required_models = [
+        FACE_MODEL_PATH,
+        HAND_MODEL_PATH,
+        POSE_MODEL_PATH,
+    ]
+
+    for model_path in required_models:
+
+        if not os.path.exists(model_path):
+
+            print()
+            print("ERROR: Required model not found:")
+            print(model_path)
+            print()
+            print(
+                "Please place the required .task model "
+                "inside the models folder."
+            )
+            print()
+            raise SystemExit(1)
+
+
+    # ============================================================
+    # RECORDING SESSION FOLDER
+    # ============================================================
+
+    os.makedirs(
+        RECORDINGS_DIR,
+        exist_ok=True
+    )
+
+    session_datetime = datetime.now()
+
+    session_name = session_datetime.strftime(
+        "%Y-%m-%d_%H-%M-%S"
+    )
+
+    session_dir = os.path.join(
+        RECORDINGS_DIR,
+        f"exam_{session_name}"
+    )
+
+    os.makedirs(
+        session_dir,
+        exist_ok=True
+    )
+
+    evidence_dir = os.path.join(
+        session_dir,
+        "evidence"
+    )
+
+    os.makedirs(
+        evidence_dir,
+        exist_ok=True
+    )
+
+    video_filename = os.path.join(
+        session_dir,
+        f"exam_{session_name}.mp4"
+    )
+
+    log_filename = os.path.join(
+        session_dir,
+        f"exam_{session_name}.txt"
+    )
+
+
+    # ============================================================
+    # LOAD MEDIAPIPE MODELS
+    # ============================================================
+
+    print()
+    print("Loading face landmarker...")
+
+    face_base_options = python.BaseOptions(
+        model_asset_path=FACE_MODEL_PATH
+    )
+
+    face_options = vision.FaceLandmarkerOptions(
+        base_options=face_base_options,
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=True,
+        num_faces=2
+    )
+
+    face_landmarker = (
+        vision.FaceLandmarker.create_from_options(
+            face_options
+        )
+    )
+
+    print("Face landmarker loaded.")
+
+
+    print("Loading hand landmarker...")
+
+    hand_base_options = python.BaseOptions(
+        model_asset_path=HAND_MODEL_PATH
+    )
+
+    hand_options = vision.HandLandmarkerOptions(
+        base_options=hand_base_options,
+        num_hands=MAX_HANDS,
+        min_hand_detection_confidence=HAND_DETECTION_CONFIDENCE,
+        min_hand_presence_confidence=HAND_PRESENCE_CONFIDENCE,
+        min_tracking_confidence=HAND_TRACKING_CONFIDENCE
+    )
+
+    hand_landmarker = (
+        vision.HandLandmarker.create_from_options(
+            hand_options
+        )
+    )
+
+    print("Hand landmarker loaded.")
+
+
+    print("Loading pose landmarker...")
+
+    pose_base_options = python.BaseOptions(
+        model_asset_path=POSE_MODEL_PATH
+    )
+
+    pose_options = vision.PoseLandmarkerOptions(
+        base_options=pose_base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+
+    pose_landmarker = (
+        vision.PoseLandmarker.create_from_options(
+            pose_options
+        )
+    )
+
+    print("Pose landmarker loaded.")
+
+
+    # ============================================================
+    # LOAD YOLO
+    # ============================================================
+
+    print("Loading object detection model...")
+
+    object_model = YOLO(
+        YOLO_MODEL
+    )
+
+    print("Object detection model loaded.")
+    print()
+
+
+    # ============================================================
+    # CAMERA
+    # ============================================================
+
+    camera = cv2.VideoCapture(camera_index)
+
+    if not camera.isOpened():
+
+        print(
+            "ERROR: Could not open webcam."
+        )
+
+        face_landmarker.close()
+        hand_landmarker.close()
+        pose_landmarker.close()
+
+        raise SystemExit(1)
+
+
+    # ============================================================
+    # CAMERA PROPERTIES
+    # ============================================================
+
+    frame_width = int(
+        camera.get(
+            cv2.CAP_PROP_FRAME_WIDTH
+        )
+    )
+
+    frame_height = int(
+        camera.get(
+            cv2.CAP_PROP_FRAME_HEIGHT
+        )
+    )
+
+    fps = camera.get(
+        cv2.CAP_PROP_FPS
+    )
+
+    if fps <= 0 or fps > 120:
+        fps = 20.0
+
+
+    # ============================================================
+    # VIDEO WRITER
+    # ============================================================
+
+    fourcc = cv2.VideoWriter_fourcc(
+        *"mp4v"
+    )
+
+    video_writer = cv2.VideoWriter(
+        video_filename,
+        fourcc,
+        fps,
+        (
+            frame_width,
+            frame_height
+        )
+    )
+
+    if not video_writer.isOpened():
+
+        print(
+            "ERROR: Could not create MP4 writer."
+        )
+
+        camera.release()
+        face_landmarker.close()
+        hand_landmarker.close()
+        pose_landmarker.close()
+
+        raise SystemExit(1)
+
+
+    # ============================================================
+    # SESSION LOG
+    # ============================================================
+
+    session_start = time.time()
+
+    log_file = open(
+        log_filename,
+        "w",
+        encoding="utf-8"
+    )
+
+    log_file.write(
+        "================================================\n"
+    )
+
+    log_file.write(
+        "              AI PROCTOR SESSION\n"
+    )
+
+    log_file.write(
+        "================================================\n\n"
+    )
+
+    log_file.write(
+        f"Session Started: "
+        f"{session_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+
+    log_file.write(
+        f"Session Folder: "
+        f"{os.path.basename(session_dir)}\n"
+    )
+
+    log_file.write(
+        f"Video File: "
+        f"{os.path.basename(video_filename)}\n"
+    )
+
+    log_file.write(
+        "\n"
+    )
+
+    log_file.write(
+        "EVENT TIMELINE\n"
+    )
+
+    log_file.write(
+        "------------------------------------------------\n"
+    )
+
+    log_file.write(
+        "00:00:00  Setup started\n"
+    )
+
+    log_file.flush()
+
+
+    # ============================================================
+    # EVENT TRACKERS
+    # ============================================================
+
+    event_names = list(
+        EVENT_WEIGHTS.keys()
+    )
+
+    event_trackers = {}
+
+    for event_name in event_names:
+
+        event_trackers[event_name] = EventTracker(
+            event_name,
+            log_file,
+            evidence_dir,
+            session_start
+        )
+
+
+    # ============================================================
+    # STATE VARIABLES
+    # ============================================================
+
+    face_missing_start = None
+    multiple_faces_start = None
+
+    head_turn_start = None
+    gaze_away_start = None
+
+    object_detected_start = None
+    hand_detected_start = None
+
+    low_light_start = None
+    framing_bad_start = None
+    camera_movement_start = None
+
+
+    # ============================================================
+    # CALIBRATION
+    # ============================================================
+
+    calibration_start = time.time()
+
+    yaw_samples = []
+    pitch_samples = []
+
+    gaze_x_samples = []
+    gaze_y_samples = []
+
+    baseline_yaw = None
+    baseline_pitch = None
+
+    baseline_gaze_x = None
+    baseline_gaze_y = None
+
+    calibration_complete = False
+
+
+    # ============================================================
+    # GAZE SMOOTHING
+    # ============================================================
+
+    smoothed_gaze_x = None
+    smoothed_gaze_y = None
+
+
+    # ============================================================
+    # CAMERA MOVEMENT
+    # ============================================================
+
+    camera_movement_detector = (
+        CameraMovementDetector()
+    )
+
+
+    # ============================================================
+    # EXAM READY / SETUP
+    # ============================================================
+
+    exam_started = False
+
+    framing_ready_since = None
+
+    FRAMING_READY_DURATION = 1.5
+
+
+    # ============================================================
+    # MAIN LOOP
+    # ============================================================
+
+    try:
+
+        while True:
+
+            success, frame = camera.read()
+
+            if not success:
+                print(
+                    "ERROR: Could not read frame."
+                )
+                break
+
+            height, width, _ = frame.shape
+
+            current_time = time.time()
+
+            active_warnings = []
+
+            # ====================================================
+            # RGB
+            # ====================================================
+
+            rgb_frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
+            )
+
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb_frame
+            )
+
+
+            # ====================================================
+            # FACE
+            # ====================================================
+
+            face_result = (
+                face_landmarker.detect(
+                    mp_image
+                )
+            )
+
+            face_count = len(
+                face_result.face_landmarks
+            )
+
+
+            # ====================================================
+            # HAND
+            # ====================================================
+
+            hand_result = (
+                hand_landmarker.detect(
+                    mp_image
+                )
+            )
+
+            hand_count = len(
+                hand_result.hand_landmarks
+            )
+
+            hand_detected = (
+                hand_count > 0
+            )
+
+
+            # ====================================================
+            # POSE
+            # ====================================================
+
+            pose_result = (
+                pose_landmarker.detect(
+                    mp_image
+                )
+            )
+
+
+            # ====================================================
+            # DEFAULT VALUES
+            # ====================================================
+
+            yaw = None
+            pitch = None
+            roll = None
+
+            gaze_x = None
+            gaze_y = None
+
+            framing_valid = False
+            framing_reason = "Checking camera position"
+
+            framing_metrics = {}
+
+
+            # ====================================================
+            # FACE COUNT EVENTS
+            # ====================================================
+
+            if face_count == 0:
+
+                head_turn_start = None
+                gaze_away_start = None
+
+                if face_missing_start is None:
+                    face_missing_start = current_time
+
+                if (
+                    current_time -
+                    face_missing_start
+                    >= FACE_MISSING_THRESHOLD
+                ):
+
+                    active_warnings.append(
+                        "Face not detected"
+                    )
+
+            else:
+
+                face_missing_start = None
+
+
+            if face_count > 1:
+
+                head_turn_start = None
+                gaze_away_start = None
+
+                if multiple_faces_start is None:
+                    multiple_faces_start = current_time
+
+                if (
+                    current_time -
+                    multiple_faces_start
+                    >= MULTIPLE_FACE_THRESHOLD
+                ):
+
+                    active_warnings.append(
+                        "Multiple faces detected"
+                    )
+
+            else:
+
+                multiple_faces_start = None
+
+
+            # ====================================================
+            # SINGLE FACE PROCESSING
+            # ====================================================
+
+            if face_count == 1:
+
+                face_landmarks = (
+                    face_result.face_landmarks[0]
+                )
+
+
+                # =================================================
+                # HEAD
+                # =================================================
+
+                yaw, pitch, roll = (
+                    calculate_head_pose(
+                        face_landmarks,
+                        width,
+                        height
+                    )
+                )
+
+
+                # =================================================
+                # GAZE
+                # =================================================
+
+                raw_gaze = calculate_gaze(
+                    face_landmarks
+                )
+
+                if raw_gaze[0] is not None:
+
+                    raw_x, raw_y = raw_gaze
+
+                    if smoothed_gaze_x is None:
+
+                        smoothed_gaze_x = raw_x
+                        smoothed_gaze_y = raw_y
+
+                    else:
+
+                        smoothed_gaze_x = (
+                            GAZE_SMOOTHING * raw_x
+                            +
+                            (1 - GAZE_SMOOTHING)
+                            * smoothed_gaze_x
+                        )
+
+                        smoothed_gaze_y = (
+                            GAZE_SMOOTHING * raw_y
+                            +
+                            (1 - GAZE_SMOOTHING)
+                            * smoothed_gaze_y
+                        )
+
+                    gaze_x = smoothed_gaze_x
+                    gaze_y = smoothed_gaze_y
+
+
+                # =================================================
+                # CALIBRATION
+                # =================================================
+
+                if not calibration_complete:
+
+                    elapsed = (
+                        current_time -
+                        calibration_start
+                    )
+
+                    if yaw is not None:
+
+                        yaw_samples.append(
+                            yaw
+                        )
+
+                        pitch_samples.append(
+                            pitch
+                        )
+
+                    if gaze_x is not None:
+
+                        gaze_x_samples.append(
+                            gaze_x
+                        )
+
+                        gaze_y_samples.append(
+                            gaze_y
+                        )
+
+                    if elapsed >= CALIBRATION_DURATION:
+
+                        if yaw_samples:
+
+                            baseline_yaw = float(
+                                np.median(
+                                    yaw_samples
+                                )
+                            )
+
+                            baseline_pitch = float(
+                                np.median(
+                                    pitch_samples
+                                )
+                            )
+
+                        if gaze_x_samples:
+
+                            baseline_gaze_x = float(
+                                np.median(
+                                    gaze_x_samples
+                                )
+                            )
+
+                            baseline_gaze_y = float(
+                                np.median(
+                                    gaze_y_samples
+                                )
+                            )
+
+                        calibration_complete = True
+
+                        print()
+                        print(
+                            "======================================"
+                        )
+                        print(
+                            "CALIBRATION COMPLETE"
+                        )
+                        print(
+                            "======================================"
+                        )
+                        print(
+                            f"Baseline Yaw: "
+                            f"{baseline_yaw:.2f}"
+                        )
+                        print(
+                            f"Baseline Pitch: "
+                            f"{baseline_pitch:.2f}"
+                        )
+                        print(
+                            f"Baseline Gaze X: "
+                            f"{baseline_gaze_x:.3f}"
+                        )
+                        print(
+                            f"Baseline Gaze Y: "
+                            f"{baseline_gaze_y:.3f}"
+                        )
+                        print(
+                            "======================================"
+                        )
+                        print()
+
+
+                # =================================================
+                # HEAD / GAZE MONITORING
+                # =================================================
+
+                elif calibration_complete:
+
+                    if yaw is not None:
+
+                        yaw_deviation = (
+                            yaw -
+                            baseline_yaw
+                        )
+
+                        pitch_deviation = (
+                            pitch -
+                            baseline_pitch
+                        )
+
+                        head_turned = (
+                            abs(yaw_deviation)
+                            > YAW_THRESHOLD
+                            or
+                            abs(pitch_deviation)
+                            > PITCH_THRESHOLD
+                        )
+
+                        if head_turned:
+
+                            if head_turn_start is None:
+                                head_turn_start = (
+                                    current_time
+                                )
+
+                            if (
+                                current_time -
+                                head_turn_start
+                                >= HEAD_WARNING_TIME
+                            ):
+
+                                if (
+                                    abs(yaw_deviation)
+                                    > YAW_THRESHOLD
+                                ):
+
+                                    if yaw_deviation > 0:
+
+                                        active_warnings.append(
+                                            "Head turned right"
+                                        )
+
+                                    else:
+
+                                        active_warnings.append(
+                                            "Head turned left"
+                                        )
+
+                                elif (
+                                    pitch_deviation
+                                    < -PITCH_THRESHOLD
+                                ):
+
+                                    active_warnings.append(
+                                        "Looking up"
+                                    )
+
+                                else:
+
+                                    active_warnings.append(
+                                        "Looking down"
+                                    )
+
+                        else:
+
+                            head_turn_start = None
+
+
+                    if (
+                        gaze_x is not None
+                        and
+                        baseline_gaze_x is not None
+                    ):
+
+                        gaze_x_deviation = (
+                            gaze_x -
+                            baseline_gaze_x
+                        )
+
+                        gaze_y_deviation = (
+                            gaze_y -
+                            baseline_gaze_y
+                        )
+
+                        gaze_away = (
+                            abs(gaze_x_deviation)
+                            > GAZE_HORIZONTAL_THRESHOLD
+                            or
+                            abs(gaze_y_deviation)
+                            > GAZE_VERTICAL_THRESHOLD
+                        )
+
+                        if gaze_away:
+
+                            if gaze_away_start is None:
+                                gaze_away_start = (
+                                    current_time
+                                )
+
+                            if (
+                                current_time -
+                                gaze_away_start
+                                >= GAZE_WARNING_TIME
+                            ):
+
+                                active_warnings.append(
+                                    "Gaze away from screen"
+                                )
+
+                        else:
+
+                            gaze_away_start = None
+
+
+            # ====================================================
+            # FRAMING CHECK
+            # ====================================================
+
+            if face_count == 1:
+
+                framing_valid, framing_reason, framing_metrics = (
+                    calculate_framing_status(
+                        pose_result,
+                        face_result.face_landmarks[0],
+                        width,
+                        height
+                    )
+                )
+
+            else:
+
+                framing_valid = False
+                framing_reason = (
+                    "Waiting for one face"
+                )
+
+
+            if framing_valid:
+
+                framing_bad_start = None
+
+                if not exam_started:
+
+                    if framing_ready_since is None:
+                        framing_ready_since = (
+                            current_time
+                        )
+
+                    if (
+                        current_time -
+                        framing_ready_since
+                        >= FRAMING_READY_DURATION
+                    ):
+
+                        exam_started = True
+
+                        elapsed = (
+                            current_time -
+                            session_start
+                        )
+
+                        log_file.write(
+                            f"{format_clock(elapsed)}  "
+                            f"Exam started - camera framing ready\n"
+                        )
+
+                        log_file.flush()
+
+                        print(
+                            "Camera framing ready. "
+                            "Exam session started."
+                        )
+
+            else:
+
+                framing_ready_since = None
+
+                if framing_bad_start is None:
+                    framing_bad_start = (
+                        current_time
+                    )
+
+                if (
+                    current_time -
+                    framing_bad_start
+                    >= FRAMING_WARNING_TIME
+                ):
+
+                    if exam_started:
+
+                        active_warnings.append(
+                            "Candidate not properly positioned"
+                        )
+
+
+            # ====================================================
+            # HAND
+            # ====================================================
+
+            if hand_detected:
+
+                if hand_detected_start is None:
+                    hand_detected_start = (
+                        current_time
+                    )
+
+                if (
+                    current_time -
+                    hand_detected_start
+                    >= HAND_WARNING_TIME
+                ):
+
+                    active_warnings.append(
+                        "Hand detected"
+                    )
+
+            else:
+
+                hand_detected_start = None
+
+
+            # ====================================================
+            # YOLO OBJECT
+            # ====================================================
+
+            detected_objects = (
+                detect_external_objects(
+                    object_model,
+                    frame
+                )
+            )
+
+            object_detected = (
+                len(detected_objects) > 0
+            )
+
+            if object_detected:
+
+                if object_detected_start is None:
+                    object_detected_start = (
+                        current_time
+                    )
+
+                if (
+                    current_time -
+                    object_detected_start
+                    >= OBJECT_WARNING_TIME
+                ):
+
+                    active_warnings.append(
+                        "Object detected"
+                    )
+
+            else:
+
+                object_detected_start = None
+
+
+            # ====================================================
+            # LOW LIGHT
+            # ====================================================
+
+            gray_frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2GRAY
+            )
+
+            average_brightness = float(
+                np.mean(gray_frame)
+            )
+
+            low_light = (
+                average_brightness
+                <
+                LOW_LIGHT_BRIGHTNESS_THRESHOLD
+            )
+
+            if low_light:
+
+                if low_light_start is None:
+                    low_light_start = (
+                        current_time
+                    )
+
+                if (
+                    current_time -
+                    low_light_start
+                    >= LOW_LIGHT_WARNING_TIME
+                ):
+
+                    active_warnings.append(
+                        "Low light"
+                    )
+
+            else:
+
+                low_light_start = None
+
+
+            # ====================================================
+            # CAMERA MOVEMENT
+            # ====================================================
+
+            camera_moved = (
+                camera_movement_detector.update(
+                    frame
+                )
+            )
+
+            if camera_moved:
+
+                if camera_movement_start is None:
+                    camera_movement_start = (
+                        current_time
+                    )
+
+                if (
+                    current_time -
+                    camera_movement_start
+                    >= CAMERA_MOVEMENT_WARNING_TIME
+                ):
+
+                    if exam_started:
+
+                        active_warnings.append(
+                            "Camera movement detected"
+                        )
+
+            else:
+
+                camera_movement_start = None
+
+
+            # ====================================================
+            # ONLY LOG BEHAVIOR EVENTS AFTER EXAM START
+            # ====================================================
+
+            if exam_started:
+
+                for event_name in event_names:
+
+                    tracker = (
+                        event_trackers[
+                            event_name
+                        ]
+                    )
+
+                    if event_name in active_warnings:
+
+                        tracker.start(
+                            current_time,
+                            frame
+                        )
+
+                    else:
+
+                        tracker.end(
+                            current_time
+                        )
+
+
+            # ====================================================
+            # RISK
+            # ====================================================
+
+            if exam_started:
+
+                risk_score = calculate_risk(
+                    active_warnings,
+                    current_time,
+                    event_trackers
+                )
+
+                risk_level = get_risk_level(
+                    risk_score
+                )
+
+            else:
+
+                risk_score = 0.0
+                risk_level = "SETUP"
+
+
+            # ====================================================
+            # DRAW FACE LANDMARKS
+            # ====================================================
+
+            if face_result.face_landmarks:
+
+                for landmarks in (
+                    face_result.face_landmarks
+                ):
+
+                    for landmark in landmarks:
+
+                        x = int(
+                            landmark.x * width
+                        )
+
+                        y = int(
+                            landmark.y * height
+                        )
+
+                        cv2.circle(
+                            frame,
+                            (x, y),
+                            1,
+                            (0, 255, 0),
+                            -1
+                        )
+
+
+            # ====================================================
+            # DRAW IRIS
+            # ====================================================
+
+            if face_count == 1:
+
+                face_landmarks = (
+                    face_result.face_landmarks[0]
+                )
+
+                iris_ids = [
+                    468, 469, 470, 471, 472,
+                    473, 474, 475, 476, 477
+                ]
+
+                for landmark_id in iris_ids:
+
+                    landmark = (
+                        face_landmarks[
+                            landmark_id
+                        ]
+                    )
+
+                    x = int(
+                        landmark.x * width
+                    )
+
+                    y = int(
+                        landmark.y * height
+                    )
+
+                    cv2.circle(
+                        frame,
+                        (x, y),
+                        2,
+                        (255, 0, 0),
+                        -1
+                    )
+
+
+            # ====================================================
+            # DRAW HAND
+            # ====================================================
+
+            if hand_result.hand_landmarks:
+
+                for hand_landmarks in (
+                    hand_result.hand_landmarks
+                ):
+
+                    for landmark in hand_landmarks:
+
+                        x = int(
+                            landmark.x * width
+                        )
+
+                        y = int(
+                            landmark.y * height
+                        )
+
+                        cv2.circle(
+                            frame,
+                            (x, y),
+                            3,
+                            (0, 0, 255),
+                            -1
+                        )
+
+                    xs = [
+                        landmark.x * width
+                        for landmark in hand_landmarks
+                    ]
+
+                    ys = [
+                        landmark.y * height
+                        for landmark in hand_landmarks
+                    ]
+
+                    x_min = max(
+                        0,
+                        int(min(xs)) - 10
+                    )
+
+                    y_min = max(
+                        0,
+                        int(min(ys)) - 10
+                    )
+
+                    x_max = min(
+                        width - 1,
+                        int(max(xs)) + 10
+                    )
+
+                    y_max = min(
+                        height - 1,
+                        int(max(ys)) + 10
+                    )
+
+                    cv2.rectangle(
+                        frame,
+                        (x_min, y_min),
+                        (x_max, y_max),
+                        (0, 0, 255),
+                        2
+                    )
+
+
+            # ====================================================
+            # DRAW YOLO OBJECT BOXES
+            # ====================================================
+
+            for obj in detected_objects:
+
+                x1, y1, x2, y2 = obj["bbox"]
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0, 0, 255),
+                    2
+                )
+
+
+            # ====================================================
+            # DRAW POSE LANDMARKS
+            # ====================================================
+
+            if pose_result.pose_landmarks:
+
+                pose_landmarks = (
+                    pose_result.pose_landmarks[0]
+                )
+
+                pose_indices = [
+                    0,      # nose
+                    11,     # left shoulder
+                    12,     # right shoulder
+                    13,     # left elbow
+                    14,     # right elbow
+                    23,     # left hip
+                    24,     # right hip
+                ]
+
+                for index in pose_indices:
+
+                    landmark = (
+                        pose_landmarks[index]
+                    )
+
+                    x = int(
+                        landmark.x * width
+                    )
+
+                    y = int(
+                        landmark.y * height
+                    )
+
+                    cv2.circle(
+                        frame,
+                        (x, y),
+                        4,
+                        (255, 0, 255),
+                        -1
+                    )
+
+
+            # ====================================================
+            # INFORMATION
+            # ====================================================
+
+            cv2.putText(
+                frame,
+                f"Faces: {face_count}",
+                (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"Hands: {hand_count}",
+                (20, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (0, 255, 255),
+                2
+            )
+
+
+            if yaw is not None:
+
+                cv2.putText(
+                    frame,
+                    f"Yaw: {yaw:.1f}",
+                    (20, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Pitch: {pitch:.1f}",
+                    (20, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Roll: {roll:.1f}",
+                    (20, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+
+            if gaze_x is not None:
+
+                cv2.putText(
+                    frame,
+                    f"Gaze X: {gaze_x:.3f}",
+                    (20, 195),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (255, 200, 0),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    f"Gaze Y: {gaze_y:.3f}",
+                    (20, 225),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (255, 200, 0),
+                    2
+                )
+
+
+            cv2.putText(
+                frame,
+                f"Brightness: "
+                f"{average_brightness:.1f}",
+                (20, 260),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (200, 200, 200),
+                2
+            )
+
+
+            # ====================================================
+            # SETUP SCREEN
+            # ====================================================
+
+            if not exam_started:
+
+                if not calibration_complete:
+
+                    elapsed = (
+                        current_time -
+                        calibration_start
+                    )
+
+                    remaining = max(
+                        0,
+                        CALIBRATION_DURATION -
+                        elapsed
+                    )
+
+                    setup_message = (
+                        f"CALIBRATING - "
+                        f"{remaining:.1f}s"
+                    )
+
+                elif framing_valid:
+
+                    setup_message = (
+                        "POSITION READY - "
+                        "HOLD STILL"
+                    )
+
+                else:
+
+                    setup_message = (
+                        "ADJUST CAMERA POSITION"
+                    )
+
+
+                cv2.rectangle(
+                    frame,
+                    (0, height - 145),
+                    (width, height),
+                    (40, 40, 40),
+                    -1
+                )
+
+                cv2.putText(
+                    frame,
+                    "EXAM SETUP",
+                    (20, height - 110),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75,
+                    (0, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    setup_message,
+                    (20, height - 75),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (255, 255, 255),
+                    2
+                )
+
+                cv2.putText(
+                    frame,
+                    framing_reason,
+                    (20, height - 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    2
+                )
+
+
+            # ====================================================
+            # RISK DISPLAY
+            # ====================================================
+
+            if risk_level == "NORMAL":
+
+                risk_color = (
+                    0, 255, 0
+                )
+
+            elif risk_level == "ATTENTION":
+
+                risk_color = (
+                    0, 255, 255
+                )
+
+            elif risk_level == "HIGH":
+
+                risk_color = (
+                    0, 165, 255
+                )
+
+            elif risk_level == "CRITICAL":
+
+                risk_color = (
+                    0, 0, 255
+                )
+
+            else:
+
+                risk_color = (
+                    0, 255, 255
+                )
+
+
+            cv2.putText(
+                frame,
+                f"Risk: {risk_score:.1f}",
+                (width - 250, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                risk_color,
+                2
+            )
+
+            cv2.putText(
+                frame,
+                f"Level: {risk_level}",
+                (width - 250, 65),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                risk_color,
+                2
+            )
+
+
+            # ====================================================
+            # CAMERA MOVEMENT DEBUG
+            # ====================================================
+
+            cv2.putText(
+                frame,
+                f"Cam shift: "
+                f"{camera_movement_detector.last_global_shift:.1f}",
+                (width - 250, 95),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (180, 180, 180),
+                1
+            )
+
+
+            # ====================================================
+            # ACTIVE WARNINGS
+            # ====================================================
+
+            if active_warnings and exam_started:
+
+                warning_count = len(
+                    active_warnings
+                )
+
+                panel_height = (
+                    70 +
+                    warning_count * 35
+                )
+
+                panel_top = max(
+                    0,
+                    height - panel_height
+                )
+
+                cv2.rectangle(
+                    frame,
+                    (0, panel_top),
+                    (width, height),
+                    (0, 0, 180),
+                    -1
+                )
+
+                cv2.putText(
+                    frame,
+                    "PROCTORING WARNINGS",
+                    (20, panel_top + 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.70,
+                    (255, 255, 255),
+                    2
+                )
+
+                for index, warning_text in enumerate(
+                    active_warnings
+                ):
+
+                    y_position = (
+                        panel_top +
+                        62 +
+                        index * 35
+                    )
+
+                    cv2.putText(
+                        frame,
+                        f"- {warning_text}",
+                        (25, y_position),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (255, 255, 255),
+                        2
+                    )
+
+
+            # ====================================================
+            # STATUS
+            # ====================================================
+
+            if not exam_started:
+
+                status = "SETUP"
+                status_color = (
+                    0, 255, 255
+                )
+
+            elif active_warnings:
+
+                status = "WARNING"
+                status_color = (
+                    0, 0, 255
+                )
+
+            else:
+
+                status = "NORMAL"
+                status_color = (
+                    0, 255, 0
+                )
+
+
+            cv2.putText(
+                frame,
+                f"Status: {status}",
+                (width - 250, 130),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                status_color,
+                2
+            )
+
+
+            # ====================================================
+            # RECORD
+            # ====================================================
+
+            video_writer.write(
+                frame
+            )
+
+            if frame_callback is not None:
+                try:
+                    frame_callback(frame)
+                except Exception:
+                    pass
+
+            if telemetry_callback is not None:
+                try:
+                    telemetry_callback({
+                        "session_name": session_name,
+                        "session_dir": session_dir,
+                        "elapsed_seconds": round(current_time - session_start, 1),
+                        "elapsed_clock": format_clock(current_time - session_start),
+                        "exam_started": exam_started,
+                        "calibration_complete": calibration_complete,
+                        "face_count": face_count,
+                        "face_detected": face_count >= 1,
+                        "multiple_faces": face_count > 1,
+                        "yaw": round(yaw, 2) if yaw is not None else None,
+                        "pitch": round(pitch, 2) if pitch is not None else None,
+                        "roll": round(roll, 2) if roll is not None else None,
+                        "gaze_x": round(gaze_x, 3) if ('gaze_x' in locals() and gaze_x is not None) else None,
+                        "gaze_y": round(gaze_y, 3) if ('gaze_y' in locals() and gaze_y is not None) else None,
+                        "hand_detected": hand_detected,
+                        "object_detected": object_detected,
+                        "objects_count": len(detected_objects) if detected_objects else 0,
+                        "low_light": low_light,
+                        "framing_valid": framing_valid,
+                        "framing_reason": framing_reason,
+                        "camera_moved": camera_moved,
+                        "active_warnings": list(active_warnings),
+                        "risk_score": round(risk_score, 1),
+                        "risk_level": risk_level,
+                        "fps": round(fps, 1),
+                    })
+                except Exception:
+                    pass
+
+            if show_window:
+                cv2.imshow(
+                    "AI Proctor",
+                    frame
+                )
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    break
+            else:
+                time.sleep(0.001)
+
+            if stop_event is not None and stop_event.is_set():
+                break
+
+
+    finally:
+
+        # ========================================================
+        # SESSION END
+        # ========================================================
+
+        session_end = time.time()
+
+        session_duration = (
+            session_end -
+            session_start
+        )
+
+
+        # ========================================================
+        # CLOSE ACTIVE EVENTS
+        # ========================================================
+
+        for tracker in event_trackers.values():
+
+            tracker.close(
+                session_end
+            )
+
+
+        # ========================================================
+        # WRITE SUMMARY
+        # ========================================================
+
+        log_file.write("\n")
+
+        log_file.write(
+            "================================================\n"
+        )
+
+        log_file.write(
+            "                 SESSION SUMMARY\n"
+        )
+
+        log_file.write(
+            "================================================\n"
+        )
+
+        log_file.write(
+            f"Session Duration: "
+            f"{format_duration(session_duration)}\n"
+        )
+
+        log_file.write(
+            "\n"
+        )
+
+        log_file.write(
+            "EVENT SUMMARY\n"
+        )
+
+        log_file.write(
+            "------------------------------------------------\n"
+        )
+
+        for event_name in event_names:
+
+            tracker = (
+                event_trackers[
+                    event_name
+                ]
+            )
+
+            if tracker.occurrences > 0:
+
+                duration_text = format_duration(
+                    tracker.total_duration
+                )
+
+                log_file.write(
+                    f"{event_name}\n"
+                )
+
+                log_file.write(
+                    f"  Occurrences: "
+                    f"{tracker.occurrences}\n"
+                )
+
+                log_file.write(
+                    f"  Total Duration: "
+                    f"{duration_text}\n"
+                )
+
+                log_file.write(
+                    "\n"
+                )
+
+
+        log_file.write(
+            "================================================\n"
+        )
+
+        log_file.write(
+            "Exam/session ended.\n"
+        )
+
+        log_file.write(
+            "================================================\n"
+        )
+
+        log_file.flush()
+        log_file.close()
+
+
+        # ========================================================
+        # CLEANUP
+        # ========================================================
+
+        camera.release()
+
+        video_writer.release()
+
+        face_landmarker.close()
+
+        hand_landmarker.close()
+
+        pose_landmarker.close()
+
+        if show_window:
+            cv2.destroyAllWindows()
+
+
+        # ========================================================
+        # FINAL MESSAGE
+        # ========================================================
+
+        print()
+        print(
+            "================================================"
+        )
+
+        print(
+            "AI PROCTOR SESSION ENDED"
+        )
+
+        print(
+            "================================================"
+        )
+
+        print(
+            "Session folder:"
+        )
+
+        print(
+            f"  {session_dir}"
+        )
+
+        print()
+
+        print(
+            "Video:"
+        )
+
+        print(
+            f"  {video_filename}"
+        )
+
+        print()
+
+        print(
+            "Event log:"
+        )
+
+        print(
+            f"  {log_filename}"
+        )
+
+        print()
+
+        print(
+            "Evidence:"
+        )
+
+        print(
+            f"  {evidence_dir}"
+        )
+
+        print(
+            "================================================"
+        )
+    return {
+        "session_name": session_name,
+        "session_dir": session_dir,
+        "video_filename": video_filename,
+        "log_filename": log_filename,
+        "evidence_dir": evidence_dir,
+        "duration": session_duration
+    }
+
+
+if __name__ == "__main__":
+    run_proctoring_session(show_window=True)
